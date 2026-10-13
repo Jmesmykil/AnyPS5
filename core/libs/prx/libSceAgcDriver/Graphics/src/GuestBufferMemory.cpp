@@ -314,8 +314,6 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
 #endif
     decideImportWatch(context, state);
-    if (state.unwatchImports) GuestMemory::Unwatch(base, bytes);
-    entry.unwatched = state.unwatchImports;
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
     GuestMemory::ImportWatched(base, bytes, [&] {
@@ -340,6 +338,10 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #endif
         return nullptr;
     }
+    // A rejected import falls back to CPU copies, so its write watch must survive.
+    // ImportWatched has returned and released the tracker lock before unwatching.
+    if (state.unwatchImports) GuestMemory::Unwatch(base, bytes);
+    entry.unwatched = state.unwatchImports;
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;

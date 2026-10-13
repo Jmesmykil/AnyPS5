@@ -204,6 +204,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_tls_diagnostics.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_load_alignment COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_load_alignment.py $<TARGET_FILE:relinker>)
+        add_test(NAME linux_dynamic_strings COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_dynamic_strings.py $<TARGET_FILE:relinker>)
         add_test(NAME executable_segments COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_executable_segments.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_entry_argv COMMAND ${Python3_EXECUTABLE}
@@ -220,6 +222,15 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_tls.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_module_directories COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_module_directories.py $<TARGET_FILE:relinker>)
+        add_test(NAME guest_startup_dependencies COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_startup_dependencies.py $<TARGET_FILE:relinker>)
+        if(NOT WIN32)
+            add_test(NAME linux_module_lifecycle COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_module_lifecycle.py
+                $<TARGET_FILE:relinker> ${CMAKE_BINARY_DIR}/core/libs/libs/libkernel.prx
+                $<TARGET_FILE:guest_module_lifecycle_tests>)
+            set_tests_properties(linux_module_lifecycle PROPERTIES TIMEOUT 90)
+        endif()
         add_test(NAME guest_symbol_names COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_symbol_names.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_host_libc COMMAND ${Python3_EXECUTABLE}

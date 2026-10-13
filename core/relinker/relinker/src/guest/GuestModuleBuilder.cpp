@@ -8,12 +8,14 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <set>
 
 namespace Relinker {
 
-std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool toIntel, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules) const {
-    const auto root = std::filesystem::absolute(inputPath).parent_path();
+std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool toIntel, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::set<std::string>& runtimeProviders) const {
+    if (std::filesystem::is_symlink(inputPath) || std::filesystem::is_symlink(std::filesystem::absolute(inputPath).parent_path())) throw Domain::RelinkerException("Guest input must not be a symbolic link");
+    const auto root = std::filesystem::canonical(std::filesystem::absolute(inputPath).parent_path());
     const auto singular = root / "sce_module";
     const auto plural = root / "sce_modules";
     const auto prx = root / "prx";
@@ -21,33 +23,42 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     const bool hasPlural = std::filesystem::exists(plural);
     const bool hasPrx = std::filesystem::exists(prx);
     if (hasSingular && hasPlural) throw Domain::RelinkerException("Both sce_module and sce_modules exist beside the input executable");
-    if (!hasSingular && !hasPlural && !hasPrx) throw Domain::RelinkerException("sce_module/sce_modules/prx was not found beside the input executable: " + root.string() + ". Use --skip-sce-module only if this game can run without these modules.");
-    std::vector<std::filesystem::path> directories;
-    if (hasSingular || hasPlural) directories.push_back(hasSingular ? singular : plural);
-    if (hasPrx) directories.push_back(prx);
+    for (const auto& directory : {singular, plural, prx}) {
+        if (std::filesystem::exists(directory) && !std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module path is not a directory: " + directory.string());
+    }
+    const auto safeRelative = [](const std::filesystem::path& path) {
+        if (path.empty() || path.is_absolute() || path.generic_string().find_first_of("\\:$\r\n") != std::string::npos) return false;
+        for (const auto& part : path) if (part == ".." || part == "." || part.empty()) return false;
+        return path.lexically_normal() == path;
+    };
+    for (const auto& name : runtimeProviders) if (!safeRelative(name) || std::filesystem::path(name).has_parent_path()) throw Domain::RelinkerException("Invalid declared runtime provider: " + name);
     std::vector<std::filesystem::path> paths;
     std::set<std::string> unmatchedExclusions = excludedModules;
-    for (const auto& directory : directories) {
-        if (!std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module path is not a directory: " + directory.string());
-        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-            if (entry.path().filename().string().ends_with(GuestModuleSuffix)) continue;
-            if (excludedModules.contains(entry.path().filename().string())) {
-                unmatchedExclusions.erase(entry.path().filename().string());
-                continue;
-            }
-            if (!entry.is_regular_file()) continue;
-            std::ifstream stream(entry.path(), std::ios::binary);
-            if (!stream) throw Domain::RelinkerException("Cannot read guest candidate: " + entry.path().string());
-            char magic[4]{};
-            stream.read(magic, 4);
-            if (stream.bad()) throw Domain::RelinkerException("Cannot read guest candidate magic: " + entry.path().string());
-            if (stream.gcount() == 4 && static_cast<unsigned char>(magic[0]) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') paths.push_back(entry.path());
-        }
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        if (entry.is_symlink()) throw Domain::RelinkerException("Guest title contains a symbolic link: " + entry.path().string());
+        if (!entry.is_regular_file() || std::filesystem::equivalent(entry.path(), inputPath)) continue;
+        const auto relative = entry.path().lexically_relative(root);
+        const auto name = entry.path().filename().string();
+        if (name.ends_with(GuestModuleSuffix) || name.ends_with(".esbak")) continue;
+        std::string extension = entry.path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; });
+        const auto first = relative.begin()->string();
+        const bool standard = first == "sce_module" || first == "sce_modules" || first == "prx";
+        std::ifstream stream(entry.path(), std::ios::binary);
+        if (!stream) throw Domain::RelinkerException("Cannot read guest candidate: " + entry.path().string());
+        char magic[4]{};
+        stream.read(magic, 4);
+        const bool elf = stream.gcount() == 4 && static_cast<unsigned char>(magic[0]) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+        if (extension != ".prx" && !(standard && (elf || extension == ".sprx" || extension == ".elf"))) continue;
+        if (!safeRelative(relative)) throw Domain::RelinkerException("Invalid guest module relative path: " + relative.generic_string());
+        if (excludedModules.contains(name)) { unmatchedExclusions.erase(name); continue; }
+        if (!elf) throw Domain::RelinkerException("Guest module must be a clean ELF, not a wrapper: " + relative.generic_string());
+        paths.push_back(entry.path());
     }
     if (!unmatchedExclusions.empty()) throw Domain::RelinkerException("Excluded guest module file not found: " + *unmatchedExclusions.begin());
     std::sort(paths.begin(), paths.end());
-    if (paths.empty()) return {};
-    if (lazyBinding) throw Domain::RelinkerException("Guest modules require eager binding; --lazy-binding is incompatible");
+    if (paths.empty() && !hasSingular && !hasPlural && !hasPrx) throw Domain::RelinkerException("sce_module/sce_modules/prx was not found beside the input executable: " + root.string() + ". Use --skip-sce-module only if this game can run without these modules.");
+    if (!paths.empty() && lazyBinding) throw Domain::RelinkerException("Guest modules require eager binding; --lazy-binding is incompatible");
     std::vector<GuestImage> images;
     std::map<std::string, std::vector<std::size_t>> exports;
     std::map<std::string, std::set<std::size_t>> sharedExports;
@@ -87,12 +98,19 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     }
     std::map<std::string, std::size_t> guestNames;
     for (std::size_t index = 0; index < images.size(); ++index) {
-        for (const auto& name : {images[index].SourcePath.filename().string(), images[index].Soname}) {
+        for (const auto& name : {images[index].SourcePath.filename().string(), images[index].Soname, images[index].SourcePath.lexically_relative(root).generic_string()}) {
             if (name.empty()) continue;
+            if (!safeRelative(name)) throw Domain::RelinkerException("Invalid guest dependency name: " + name);
             const auto [found, inserted] = guestNames.emplace(name, index);
             if (!inserted && found->second != index) throw Domain::RelinkerException("Ambiguous guest dependency name: " + name);
         }
     }
+    const auto resolveDependency = [&](const std::string& name, const std::string& importer) -> std::optional<std::size_t> {
+        if (!safeRelative(name)) throw Domain::RelinkerException("Invalid dependency path in " + importer + ": " + name);
+        if (const auto found = guestNames.find(name); found != guestNames.end()) return found->second;
+        if (runtimeProviders.contains(name)) return std::nullopt;
+        throw Domain::RelinkerException("Unresolved dependency in " + importer + ": " + name + " (no guest or declared runtime provider)");
+    };
     const auto rejectSharedImport = [&](const std::string& name, const std::string& importer) {
         const auto shared = sharedExports.find(name);
         if (shared == sharedExports.end()) return;
@@ -106,6 +124,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         Io::AppendString(strings, name + GuestSymbolSuffix);
     };
     if (dynamic.DynSymData.size() % 24 != 0) throw Domain::RelinkerException("Invalid executable symbol table");
+    std::set<std::size_t> startupRoots;
     for (std::size_t offset = 0; offset < dynamic.DynSymData.size(); offset += 24) {
         if (Io::ReadU16(dynamic.DynSymData, offset + 6) != 0) continue;
         const auto nameOffset = Io::ReadU32(dynamic.DynSymData, offset);
@@ -115,6 +134,13 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (end == dynamic.DynStrData.end()) throw Domain::RelinkerException("Unterminated executable symbol name");
         const std::string name(start, end);
         rejectSharedImport(name.substr(0, name.find('#')), inputPath.string());
+        if (!windows) {
+            const auto provider = exports.find(name);
+            if (provider != exports.end()) {
+                if (provider->second.size() != 1) throw Domain::RelinkerException("Ambiguous executable guest import: " + name);
+                startupRoots.insert(provider->second.front());
+            }
+        }
         if (!windows && exports.contains(name)) rename(dynamic.DynSymData, dynamic.DynStrData, offset / 24, name);
     }
     std::vector<std::set<std::size_t>> dependencies(images.size());
@@ -125,8 +151,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     }
     for (std::size_t index = 0; index < images.size(); ++index) {
         for (const auto& name : images[index].Dependencies) {
-            const auto found = guestNames.find(name);
-            if (found != guestNames.end() && found->second != index) dependencies[index].insert(found->second);
+            const auto found = resolveDependency(name, images[index].SourcePath.string());
+            if (found && *found != index) dependencies[index].insert(*found);
         }
         for (const auto& symbol : images[index].Symbols) {
             if (symbol.Section != 0 || symbol.Name.empty()) continue;
@@ -170,10 +196,15 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     for (std::size_t index = 0; index < images.size(); ++index) visit(index);
     std::vector<std::string> hostLibraries;
     std::set<std::string> uniqueHosts;
-    const auto addHost = [&](const std::string& name) {
-        if (guestNames.contains(name)) return;
+    std::vector<std::vector<std::string>> imageHosts(images.size());
+    const auto hostName = [&](const std::string& name, const std::string& importer) {
+        if (resolveDependency(name, importer).has_value()) return false;
         if (name.empty() || name.find_first_of("/\\:$") != std::string::npos) throw Domain::RelinkerException("Invalid host dependency: " + name);
-        if (uniqueHosts.insert(name).second) hostLibraries.push_back(name);
+        return true;
+    };
+    const auto addHost = [&](const std::string& name) {
+        if (const auto guest = resolveDependency(name, inputPath.string())) { startupRoots.insert(*guest); return; }
+        if (hostName(name, inputPath.string()) && uniqueHosts.insert(name).second) hostLibraries.push_back(name);
     };
     if (dynamic.DynamicSegmentData.size() % 16 != 0) throw Domain::RelinkerException("Invalid executable dependency table");
     for (std::size_t offset = 0; offset < dynamic.DynamicSegmentData.size(); offset += 16) {
@@ -185,35 +216,63 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (end == dynamic.DynStrData.end()) throw Domain::RelinkerException("Unterminated dependency string");
         addHost(std::string(start, end));
     }
-    for (const auto& image : images) for (const auto& dependency : image.Dependencies) addHost(dependency);
-    if (uniqueHosts.contains("libSceLibcInternal.prx") && uniqueHosts.insert("libc.prx").second) hostLibraries.push_back("libc.prx");
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        std::set<std::string> seen;
+        for (const auto& name : images[index].Dependencies) {
+            if (!hostName(name, images[index].SourcePath.string())) continue;
+            if (seen.insert(name).second) imageHosts[index].push_back(name);
+            if (windows && uniqueHosts.insert(name).second) hostLibraries.push_back(name);
+        }
+        if (!windows && images[index].Init != 0) {
+            if (!runtimeProviders.contains("libkernel.prx")) throw Domain::RelinkerException("Guest initializer requires declared runtime provider libkernel.prx");
+            if (seen.insert("libkernel.prx").second) imageHosts[index].push_back("libkernel.prx");
+        }
+        if (seen.contains("libSceLibcInternal.prx")) {
+            if (!runtimeProviders.contains("libc.prx")) throw Domain::RelinkerException("libSceLibcInternal requires declared runtime provider libc.prx");
+            if (seen.insert("libc.prx").second) imageHosts[index].push_back("libc.prx");
+        }
+    }
+    if (uniqueHosts.contains("libSceLibcInternal.prx")) {
+        if (!runtimeProviders.contains("libc.prx")) throw Domain::RelinkerException("libSceLibcInternal requires declared runtime provider libc.prx");
+        if (uniqueHosts.insert("libc.prx").second) hostLibraries.push_back("libc.prx");
+    }
     dynamic.DynamicSegmentData.clear();
     const auto addNeeded = [&](const std::string& name) {
         Io::AppendU64(dynamic.DynamicSegmentData, 1);
         Io::AppendU64(dynamic.DynamicSegmentData, dynamic.DynStrData.size());
         Io::AppendString(dynamic.DynStrData, name);
     };
-    for (const auto index : order) if (!windows) addNeeded("$ORIGIN/app0/" + images[index].SourcePath.parent_path().filename().generic_string() + "/" + images[index].OutputName);
+    const auto relativeDirectoryFor = [&](const GuestImage& image) {
+        auto directory = image.SourcePath.parent_path().lexically_relative(root);
+        return directory == "." ? std::filesystem::path("app0") : std::filesystem::path("app0") / directory;
+    };
+    std::set<std::size_t> startupClosure;
+    const std::function<void(std::size_t)> includeStartup = [&](std::size_t index) {
+        if (!startupClosure.insert(index).second) return;
+        for (const auto dependency : dependencies[index]) includeStartup(dependency);
+    };
+    for (const auto rootIndex : startupRoots) includeStartup(rootIndex);
+    for (const auto index : order) if (!windows && startupClosure.contains(index)) addNeeded("$ORIGIN/" + (relativeDirectoryFor(images[index]) / images[index].OutputName).generic_string());
     for (const auto& name : hostLibraries) addNeeded(name);
-    std::string guestRunPath = runPath;
-    if (!windows) {
-        if (guestRunPath == "$ORIGIN") guestRunPath = "$ORIGIN/../..";
-        else if (guestRunPath.starts_with("$ORIGIN/")) guestRunPath.insert(8, "../../");
-        else if (!std::filesystem::path(guestRunPath).is_absolute()) throw Domain::RelinkerException("Guest Linux run path must be absolute or begin with $ORIGIN");
-    }
     std::vector<GuestArtifact> artifacts;
     for (const auto index : order) {
         const auto& image = images[index];
-        const auto relativeDirectory = "app0/" + image.SourcePath.parent_path().filename().generic_string();
+        const auto relativeDirectory = relativeDirectoryFor(image);
         const auto destination = std::filesystem::absolute(outputPath).parent_path() / relativeDirectory;
         const auto target = destination / image.OutputName;
+        if (std::filesystem::is_symlink(target)) throw Domain::RelinkerException("Guest output file is a symbolic link: " + target.string());
+        auto parent = std::filesystem::absolute(outputPath).parent_path();
+        for (const auto& part : relativeDirectory) {
+            parent /= part;
+            if (std::filesystem::is_symlink(parent)) throw Domain::RelinkerException("Guest output directory is a symbolic link: " + parent.string());
+        }
         if (target.lexically_normal() == std::filesystem::absolute(outputPath).lexically_normal()) throw Domain::RelinkerException("Guest output collides with the executable output");
         for (const auto& source : paths) if (std::filesystem::exists(target) && std::filesystem::equivalent(source, target)) throw Domain::RelinkerException("Guest output would overwrite an input module: " + target.string());
         if (std::filesystem::exists(target) && std::filesystem::equivalent(inputPath, target)) throw Domain::RelinkerException("Guest output would overwrite the input executable");
         Domain::GuestRuntime runtime;
         runtime.UsePlatformTlsResolver = image.UsePlatformTlsResolver;
-        runtime.Path = relativeDirectory + "/" + image.OutputName;
-        runtime.Names = {image.SourcePath.filename().string(), image.Soname};
+        runtime.Path = (relativeDirectory / image.OutputName).generic_string();
+        runtime.Names = {image.SourcePath.filename().string(), image.Soname, image.SourcePath.lexically_relative(root).generic_string()};
         std::vector<std::uint8_t> output;
         if (windows) output = Elfpatcher::GuestModuleWriter().WriteWindows(image, runtime);
         else {
@@ -222,7 +281,13 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 const auto dependencyPath = images[dependency].SourcePath.parent_path() / images[dependency].OutputName;
                 needed.push_back("$ORIGIN/" + dependencyPath.lexically_relative(image.SourcePath.parent_path()).generic_string());
             }
-            needed.insert(needed.end(), hostLibraries.begin(), hostLibraries.end());
+            needed.insert(needed.end(), imageHosts[index].begin(), imageHosts[index].end());
+            std::string guestRunPath = runPath;
+            std::string prefix;
+            for (const auto& part : relativeDirectory) { static_cast<void>(part); prefix += "../"; }
+            if (guestRunPath == "$ORIGIN") guestRunPath = "$ORIGIN/" + prefix.substr(0, prefix.size() - 1);
+            else if (guestRunPath.starts_with("$ORIGIN/")) guestRunPath.insert(8, prefix);
+            else if (!std::filesystem::path(guestRunPath).is_absolute()) throw Domain::RelinkerException("Guest Linux run path must be absolute or begin with $ORIGIN");
             output = Elfpatcher::GuestModuleWriter().WriteLinux(image, needed, guestRunPath);
         }
         dynamic.GuestModules.push_back(std::move(runtime));

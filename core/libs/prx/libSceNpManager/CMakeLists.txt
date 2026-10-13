@@ -1,0 +1,15 @@
+add_library(libSceNpManager SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceNpManager PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceNpManager)
+
+if(BUILD_TESTING AND NOT WIN32)
+    find_package(Threads REQUIRED)
+    add_test_executable(npmanager_offline_reachability_tests tests/OfflineReachability.cpp)
+    target_include_directories(npmanager_offline_reachability_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(npmanager_offline_reachability_tests PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    add_custom_target(npmanager_offline_patched DEPENDS ${PATCHED_DIR}/libSceNpManager.prx)
+    add_dependencies(npmanager_offline_reachability_tests npmanager_offline_patched)
+    add_test(NAME npmanager_offline_reachability COMMAND npmanager_offline_reachability_tests
+        ${PATCHED_DIR}/libSceNpManager.prx)
+    set_tests_properties(npmanager_offline_reachability PROPERTIES TIMEOUT 15)
+endif()

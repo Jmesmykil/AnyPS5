@@ -18,11 +18,6 @@
 namespace GuestArena {
 namespace {
 
-constexpr std::uintptr_t ArenaStart = 0x0000000200000000ull;
-constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull;
-constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull;
-constexpr std::uintptr_t ApplicationAreaEnd = 0x000000FC00000000ull;
-
 std::uintptr_t alignUp(std::uintptr_t value, std::size_t alignment) {
     return (value + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
 }

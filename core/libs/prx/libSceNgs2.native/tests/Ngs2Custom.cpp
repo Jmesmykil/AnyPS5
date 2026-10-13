@@ -11,6 +11,12 @@ struct Calls {
     std::vector<std::uint32_t> processFlags;
     std::vector<int> order;
     int processResult = SCE_NGS2_OK;
+    int controlResult = SCE_NGS2_OK;
+    std::uint32_t controlCount = 0;
+    uintptr_t controlVoice = 0;
+    uintptr_t destroyRack = 0;
+    void* controlCommon = nullptr;
+    void* controlParam = nullptr;
 };
 static Calls calls;
 
@@ -51,7 +57,36 @@ static std::int32_t APS5_VABI Offset(Ngs2UserFx2ProcessContext* context) {
     return SCE_NGS2_OK;
 }
 
-static std::int32_t APS5_VABI ControlHandler(Ngs2UserFx2ControlContext*) {
+struct GainControl {
+    float multiplier;
+    float offset;
+};
+static_assert(sizeof(GainControl) != sizeof(float));
+
+static std::int32_t APS5_VABI ControlHandler(Ngs2UserFx2ControlContext* context) {
+    Require(context->common != nullptr && context->param != nullptr && context->user_data == 0x77);
+    for (const auto reserved : context->reserved) Require(reserved == 0);
+    if (calls.controlCommon != nullptr) Require(context->common == calls.controlCommon && context->param == calls.controlParam);
+    calls.controlCommon = context->common;
+    calls.controlParam = context->param;
+    // Read-only API reentrancy must succeed under the recursive engine lock.
+    Ngs2VoiceChannelsInfo channels{};
+    Require(sceNgs2VoiceQueryInfo(calls.controlVoice, SCE_NGS2_VOICE_INFO_CHANNELS, &channels, sizeof(channels)) == SCE_NGS2_OK);
+    Require(channels.num_channels == 2);
+    calls.controlCount++;
+    if (calls.destroyRack != 0) {
+        Require(sceNgs2RackDestroy(calls.destroyRack, nullptr) == SCE_NGS2_OK);
+        return SCE_NGS2_OK;
+    }
+    if (calls.controlResult != SCE_NGS2_OK) return calls.controlResult;
+    if (context->data_size == 0) {
+        Require(context->data == nullptr);
+        *static_cast<float*>(context->param) = *static_cast<const float*>(context->common);
+    } else {
+        Require(context->data_size == sizeof(GainControl));
+        const auto& control = *static_cast<const GainControl*>(context->data);
+        *static_cast<float*>(context->param) = control.multiplier * *static_cast<const float*>(context->common) + control.offset;
+    }
     return SCE_NGS2_OK;
 }
 
@@ -215,17 +250,76 @@ static void TestRackOptions() {
     }
     Require(failed && calls.setupVoices.empty());
 
-    auto withControl = Module(Gain);
-    withControl.control_handler = ControlHandler;
-    const auto voice = Voice(CustomRack(system, RackOption(&withControl, 1)));
-    const float gain = 0.5f;
-    Require(ControlThrows<std::runtime_error>(voice, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2 | 0, Ngs2CustomVoiceUserFx2Param{{}, &gain, sizeof(gain)}));
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
-    Require(calls.cleanupVoices == (std::vector<std::uint32_t>{0, 1}));
+}
+
+static void TestUserFxControl() {
+    calls = {};
+    const auto system = CreateSystem();
+    const auto master = Mastering(system, 2);
+    auto module = Module(Gain);
+    module.control_handler = ControlHandler;
+    const auto rack = CustomRack(system, RackOption(&module, 1));
+    const auto custom = Voice(rack);
+    calls.controlVoice = custom;
+    Control(custom, SCE_NGS2_CUSTOM_SUBMIXER_VOICE_PARAM_SETUP, Ngs2CustomSubmixerVoiceSetupParam{{}, 2, 2, 0, 0});
+    Patch(custom, master);
+    Event(custom, SCE_NGS2_VOICE_EVENT_PLAY);
+    std::vector<std::int16_t> pcm(Grain * 2 * 8, 16384);
+    const auto sampler = Sampler(system, pcm);
+    Patch(sampler, custom);
+    Event(sampler, SCE_NGS2_VOICE_EVENT_PLAY);
+
+    // The handler consumes a command bigger than the parameter storage and
+    // computes the actual gain using the module's shared common state.
+    const GainControl gain{2.0f, 0.0f};
+    Control(custom, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2, Ngs2CustomVoiceUserFx2Param{{}, &gain, sizeof(gain)});
+    auto out = Render(system);
+    for (const auto sample : out) Require(sample == 0.25f);
+    Require(calls.controlCount == 1 && calls.processFlags == (std::vector<std::uint32_t>{3}));
+    out = Render(system);
+    Require(calls.processFlags.back() == 0);
+
+    // Zero-length command data is valid for a handler even with nonempty param.
+    Control(custom, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2, Ngs2CustomVoiceUserFx2Param{{}, nullptr, 0});
+    out = Render(system);
+    for (const auto sample : out) Require(sample == 0.0625f);
+    Require(calls.controlCount == 2 && calls.processFlags.back() == 2);
+
+    Require(ControlThrows<std::invalid_argument>(custom, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2, Ngs2CustomVoiceUserFx2Param{{}, nullptr, sizeof(gain)}));
+    Require(ControlThrows<std::invalid_argument>(custom, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2 | 1, Ngs2CustomVoiceUserFx2Param{{}, &gain, sizeof(gain)}));
+    Require(calls.controlCount == 2);
+    calls.controlResult = -7;
+    bool failed = false;
+    try {
+        Control(custom, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2, Ngs2CustomVoiceUserFx2Param{{}, &gain, sizeof(gain)});
+    } catch (const std::runtime_error& error) {
+        failed = std::strstr(error.what(), "failed with -7") != nullptr;
+    }
+    Require(failed && calls.controlCount == 3);
+    out = Render(system);
+    for (const auto sample : out) Require(sample == 0.0625f);
+    Require(calls.processFlags.back() == 0);
+    calls.controlResult = SCE_NGS2_OK;
+
+    // Destructive callback reentrancy returns a diagnosed failure without
+    // touching freed parameter storage after callback return.
+    calls.destroyRack = rack;
+    failed = false;
+    try {
+        Control(custom, SCE_NGS2_CUSTOM_VOICE_PARAM_USER_FX2, Ngs2CustomVoiceUserFx2Param{{}, &gain, sizeof(gain)});
+    } catch (const std::runtime_error& error) {
+        failed = std::strstr(error.what(), "destroyed its rack") != nullptr;
+    }
+    Require(failed && calls.cleanupVoices == (std::vector<std::uint32_t>{0, 1}));
+    out = Render(system);
+    for (const auto sample : out) Require(sample == 0.0f);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
 }
 
 int main() {
     TestUserFxChain();
     TestRackOptions();
+    TestUserFxControl();
     return 0;
 }

@@ -40,9 +40,9 @@ std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
     throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
 }
 
-// The color buffer as a single-mip 2D surface descriptor (tile mode SW_64KB_R_X).
+// Describe the same guest bytes as a storage surface, before looking up a cached image.
 GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    Require(color.tileMode == ColorTileMode::RenderTarget || color.tileMode == ColorTileMode::Standard4KB, "only 4 KiB standard and 64 KiB tiled color targets are resident");
+    Require(color.tileMode == ColorTileMode::Linear || color.tileMode == ColorTileMode::RenderTarget || color.tileMode == ColorTileMode::Standard4KB, "unsupported resident color target tiling");
     const bool chain = color.mipCount > 1;
     GuestTextureResource surface{};
     surface.baseAddress = chain ? color.surfaceAddress : color.address;
@@ -62,6 +62,29 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     surface.dstSelW = 7;
     surface.dccAddress = color.dccAddress;
     surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
+    if (color.tileMode == ColorTileMode::Linear) {
+        // Only an unpadded, single-level 2D target is proved here. Other layouts keep
+        // the existing CPU transfer path rather than guessing a storage row stride.
+        Require(color.mipCount == 1 && color.mip == 0 && !color.mipTail && color.depth == 1 && color.depthSlice == 0,
+                "linear resident target must be a single-level 2D surface");
+        Require((color.surfaceAddress == 0 || color.surfaceAddress == color.address) &&
+                (color.surfaceExtent.width == 0 || color.surfaceExtent.width == color.extent.width) &&
+                (color.surfaceExtent.height == 0 || color.surfaceExtent.height == color.extent.height),
+                "linear resident target surface differs from its view");
+        Require(BytesPerElement(surface.format) == color.elementBytes && BlockWidth(surface.format) == 1 && BlockHeight(surface.format) == 1,
+                "linear resident target format geometry differs");
+        const ColorTargetLayout layout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        const auto geometry = DescribeSurface(surface);
+        Require(geometry.mips.size() == 1 && geometry.layers == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1 && !geometry.thick,
+                "linear resident target storage dimensions differ");
+        const auto& mip = geometry.mips.front();
+        const auto rowBytes = static_cast<std::uint64_t>(color.extent.width) * color.elementBytes;
+        Require(mip.width == color.extent.width && mip.height == color.extent.height &&
+                mip.pitchBytes == rowBytes && mip.tiledOffset == 0 && mip.linearOffset == 0 && !mip.tail &&
+                mip.tiledSize == layout.Bytes() && mip.linearSize == layout.LinearBytes() &&
+                geometry.guestBytes == color.bytes && color.bytes == layout.Bytes() && layout.Bytes() == layout.LinearBytes(),
+                "linear resident target storage pitch or byte range differs");
+    }
     return surface;
 }
 
@@ -1508,7 +1531,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
-        if ((binding.gpuTiling || (color.tileMode == ColorTileMode::Standard4KB && context.detiler != nullptr)) && residentTargets) {
+        if ((binding.gpuTiling || (context.detiler != nullptr && (color.tileMode == ColorTileMode::Standard4KB || color.tileMode == ColorTileMode::Linear))) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
             // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts

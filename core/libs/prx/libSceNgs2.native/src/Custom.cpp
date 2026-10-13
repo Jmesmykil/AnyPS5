@@ -75,10 +75,23 @@ static void SetupCustomSubmixer(Ngs2Voice& voice, const Ngs2CustomSubmixerVoiceS
 static void SetUserFxParam(Ngs2Voice& voice, std::uint32_t index, const Ngs2CustomVoiceUserFx2Param& param) {
     if (index >= voice.userFx.size()) APS5_INVALID_ARG_EX;
     const auto& module = voice.rack->userFx[index];
-    if (module.control_handler != nullptr) throw std::runtime_error("NGS2: the UserFx2 control handler is not implemented");
     auto& fx = voice.userFx[index];
-    if (param.data_size != fx.param.size() || (param.data == nullptr && param.data_size != 0)) APS5_INVALID_ARG_EX;
-    if (param.data_size != 0) std::memcpy(fx.param.data(), param.data, param.data_size);
+    if (param.data == nullptr && param.data_size != 0) APS5_INVALID_ARG_EX;
+    if (module.control_handler == nullptr) {
+        if (param.data_size != fx.param.size()) APS5_INVALID_ARG_EX;
+        if (param.data_size != 0) std::memcpy(fx.param.data(), param.data, param.data_size);
+    } else {
+        const auto rackHandle = reinterpret_cast<Ngs2Handle>(voice.rack);
+        const auto rackUid = voice.rack->uid;
+        Ngs2UserFx2ControlContext context{param.data, param.data_size, voice.rack->userFxCommon[index].data(),
+                                         fx.param.data(), module.user_data, {}};
+        const int result = module.control_handler(&context);
+        // The recursive engine lock allows callback queries. A callback may also
+        // destroy its owner; do not access the now invalid voice/module storage.
+        const auto* rack = Ngs2FindRack(rackHandle);
+        if (rack == nullptr || rack->uid != rackUid) throw std::runtime_error("NGS2: the UserFx2 control handler destroyed its rack");
+        if (result != SCE_NGS2_OK) throw std::runtime_error("NGS2: the UserFx2 control handler failed with " + std::to_string(result));
+    }
     fx.flags |= USER_FX2_FLAG_PARAM_CHANGED;
 }
 

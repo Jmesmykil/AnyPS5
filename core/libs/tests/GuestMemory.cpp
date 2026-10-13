@@ -6,6 +6,7 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include <array>
+#include <cerrno>
 #include "SceTypes.hpp"
 #include <chrono>
 #include <cstring>
@@ -25,7 +26,35 @@
 #include <fstream>
 #include <string>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#endif
+
+#if defined(__linux__)
+// Test-only interposition: normal calls go directly to Linux. An armed mode
+// affects exactly one NOREPLACE call in the production placement path.
+static int placementMmapMode = 0;
+static void* placementInjectedMapping = nullptr;
+static std::size_t placementInjectedLength = 0;
+static int placementNoreplaceCalls = 0;
+extern "C" void* mmap(void* address, std::size_t bytes, int protection, int flags, int fd, off_t offset) noexcept {
+    if ((flags & MAP_FIXED_NOREPLACE) != 0) {
+        ++placementNoreplaceCalls;
+        const int mode = placementMmapMode;
+        placementMmapMode = 0;
+        if (mode != 0) {
+            const auto wanted = mode == 1 ? address : nullptr;
+            const int options = mode == 1 ? flags : flags & ~MAP_FIXED_NOREPLACE;
+            void* mapped = reinterpret_cast<void*>(::syscall(SYS_mmap, wanted, bytes, protection, options, fd, offset));
+            if (mapped == MAP_FAILED) return MAP_FAILED;
+            placementInjectedMapping = mapped;
+            placementInjectedLength = bytes;
+            if (mode == 1) { errno = EEXIST; return MAP_FAILED; }
+            return mapped;
+        }
+    }
+    return reinterpret_cast<void*>(::syscall(SYS_mmap, address, bytes, protection, flags, fd, offset));
+}
 #endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -73,6 +102,116 @@ static void Require(bool condition, std::source_location location = std::source_
         std::abort();
     }
 }
+
+#if defined(__linux__)
+static bool CanonicalGuestRange(const void* pointer, std::size_t bytes) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    return address >= GuestArena::ArenaStart && address <= GuestArena::ApplicationAreaEnd &&
+        bytes <= GuestArena::ApplicationAreaEnd - address &&
+        (address + bytes <= GuestArena::SystemReservedStart || address >= GuestArena::SystemReservedEnd);
+}
+
+static void CheckCanonicalAutoPlacement() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t alignment = 0x200000;
+    constexpr std::size_t directBytes = std::size_t{2} << 30;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, directBytes, alignment, 0, &phys) == 0);
+    void* direct = nullptr;
+    Require(sceKernelMapDirectMemory(&direct, directBytes, 3, 0, phys, alignment) == 0);
+    std::printf("canonical direct mapping %p+0x%zx\n", direct, directBytes);
+    Require(CanonicalGuestRange(direct, directBytes) && (reinterpret_cast<std::uintptr_t>(direct) & (alignment - 1)) == 0);
+    static_cast<volatile unsigned char*>(direct)[0] = 0x5a;
+    static_cast<volatile unsigned char*>(direct)[directBytes - 1] = 0xa5;
+    Require(sceKernelMunmap(direct, directBytes) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, directBytes) == 0);
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, page, 3, 0) == 0 && CanonicalGuestRange(flexible, page));
+    Require(sceKernelMunmap(flexible, page) == 0);
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page, 0, alignment) == 0 && CanonicalGuestRange(reserved, page));
+    Require((reinterpret_cast<std::uintptr_t>(reserved) & (alignment - 1)) == 0);
+    Require(sceKernelMunmap(reserved, page) == 0);
+    void* anonymous = mmap_nid_postfix(nullptr, page, 3, 0x1002, -1, 0);
+    Require(anonymous != MAP_FAILED && CanonicalGuestRange(anonymous, page));
+    Require(munmap_nid_postfix(anonymous, page) == 0);
+    // A 32GiB alignment places the first candidate inside the reserved hole;
+    // no enormous placeholder allocation is required to prove it is skipped.
+    reserved = nullptr;
+    constexpr std::size_t largeAlignment = std::size_t{1} << 35;
+    Require(sceKernelReserveVirtualRange(&reserved, page, 0, largeAlignment) == 0);
+    Require(CanonicalGuestRange(reserved, page) && reinterpret_cast<std::uintptr_t>(reserved) >= GuestArena::SystemReservedEnd);
+    Require((reinterpret_cast<std::uintptr_t>(reserved) & (largeAlignment - 1)) == 0);
+    Require(sceKernelMunmap(reserved, page) == 0);
+}
+
+static void CheckCanonicalCollisionAndFailure() {
+    constexpr std::size_t page = 0x4000;
+    void* occupied = nullptr;
+    Require(sceKernelReserveVirtualRange(&occupied, page, 0, page) == 0);
+    Require(sceKernelMunmap(occupied, page) == 0);
+    Require(mmap(occupied, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == occupied);
+    static_cast<volatile unsigned char*>(occupied)[0] = 0x7b;
+    void* other = nullptr;
+    Require(sceKernelMapFlexibleMemory(&other, page, 3, 0) == 0 && other != occupied && CanonicalGuestRange(other, page));
+    Require(static_cast<volatile unsigned char*>(occupied)[0] == 0x7b);
+    Require(sceKernelMunmap(other, page) == 0 && munmap(occupied, page) == 0);
+    placementInjectedMapping = nullptr;
+    placementMmapMode = 1;
+    const int beforeRetry = placementNoreplaceCalls;
+    other = nullptr;
+    Require(sceKernelMapFlexibleMemory(&other, page, 3, 0) == 0);
+    Require(placementMmapMode == 0 && placementInjectedMapping && placementNoreplaceCalls >= beforeRetry + 2);
+    Require(other != placementInjectedMapping && CanonicalGuestRange(other, page));
+    Require(sceKernelMunmap(other, page) == 0);
+    Require(munmap(placementInjectedMapping, placementInjectedLength) == 0);
+    placementInjectedMapping = nullptr;
+    placementMmapMode = 2;
+    other = nullptr;
+    bool refused = false;
+    try { refused = sceKernelMapFlexibleMemory(&other, page, 3, 0) != 0; }
+    catch (const std::exception&) { refused = true; }
+    Require(refused && other == nullptr && placementMmapMode == 0 && placementInjectedMapping);
+    const auto nativePage = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    Require(nativePage != 0);
+    std::vector<unsigned char> residency((page + nativePage - 1) / nativePage);
+    errno = 0;
+    Require(mincore(placementInjectedMapping, page, residency.data()) == -1 && errno == ENOMEM);
+    for (const auto align : {page, std::size_t{1} << 63}) {
+        other = nullptr; refused = false;
+        const auto length = align == page ? GuestArena::ApplicationAreaEnd - GuestArena::ArenaStart : page;
+        const int before = placementNoreplaceCalls;
+        try { refused = sceKernelReserveVirtualRange(&other, length, 0, align) != 0; }
+        catch (const std::exception&) { refused = true; }
+        Require(refused && other == nullptr && placementNoreplaceCalls == before);
+    }
+    // Actual occupied-window exhaustion: two uncommitted host reservations
+    // cover the valid ranges. They are not registered as guest allocations.
+    const auto lowerBytes = GuestArena::SystemReservedStart - GuestArena::ArenaStart;
+    const auto upperBytes = GuestArena::ApplicationAreaEnd - GuestArena::SystemReservedEnd;
+    void* lower = reinterpret_cast<void*>(GuestArena::ArenaStart);
+    void* upper = reinterpret_cast<void*>(GuestArena::SystemReservedEnd);
+    Require(mmap(lower, lowerBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == lower);
+    Require(mmap(upper, upperBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == upper);
+    other = nullptr; refused = false;
+    const int beforeExhaustion = placementNoreplaceCalls;
+    try { refused = sceKernelMapFlexibleMemory(&other, page, 3, 0) != 0; }
+    catch (const std::exception&) { refused = true; }
+    Require(refused && other == nullptr && placementNoreplaceCalls == beforeExhaustion);
+    Require(munmap(lower, lowerBytes) == 0 && munmap(upper, upperBytes) == 0);
+    constexpr std::size_t nearEndAlignment = std::size_t{1} << 35;
+    constexpr auto nearEnd = GuestArena::ApplicationAreaEnd & ~(nearEndAlignment - 1);
+    Require(GuestArena::ApplicationAreaEnd - nearEnd < nearEndAlignment);
+    Require(mmap(lower, lowerBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == lower);
+    const auto occupiedUpper = nearEnd - GuestArena::SystemReservedEnd;
+    Require(mmap(upper, occupiedUpper, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == upper);
+    other = nullptr;
+    Require(sceKernelReserveVirtualRange(&other, page, 0, nearEndAlignment) == 0);
+    Require(reinterpret_cast<std::uintptr_t>(other) == nearEnd && CanonicalGuestRange(other, page));
+    Require(sceKernelMunmap(other, page) == 0);
+    Require(munmap(lower, lowerBytes) == 0 && munmap(upper, occupiedUpper) == 0);
+}
+#endif
 
 static const char* NameAt(const void* address) {
     static VirtualQueryInfo info;
@@ -916,6 +1055,10 @@ static void CheckDirectMemoryWriteWatch() {
 #endif
 
 int main() {
+#if defined(__linux__)
+    CheckCanonicalAutoPlacement();
+    CheckCanonicalCollisionAndFailure();
+#endif
     CheckReleaseFlexibleMemory();
     CheckNamedAndHintedMappings();
     CheckInternalNamedFlexibleMapping();

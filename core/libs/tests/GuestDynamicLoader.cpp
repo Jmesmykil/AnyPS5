@@ -4,6 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <thread>
+#include <chrono>
 extern "C" {
 void* APS5_VABI dlopen_nid_postfix(const char*, int);
 void* APS5_VABI dlsym_nid_postfix(void*, const char*);
@@ -73,6 +74,24 @@ int main(int argc, char** argv) {
     Require(dlclose_nid_postfix(redirected) == 0);
     std::filesystem::remove(guest);
     std::filesystem::remove(relinked);
+
+    // The kernel resolves the supplied full guest path before appending the
+    // relinked suffix; nested plugins must retain that directory hierarchy.
+    const auto nestedRoot = std::filesystem::path(
+        "anyps5-nested-module-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(!std::filesystem::exists(nestedRoot));
+    const auto nestedGuest = nestedRoot / "engine" / "plugins" / "nested.prx";
+    std::filesystem::create_directories(nestedGuest.parent_path());
+    auto nestedRelinked = nestedGuest;
+    nestedRelinked += ".guest.prx";
+    { std::ofstream elf(nestedGuest, std::ios::binary); elf.write("\x7f" "ELF", 4); }
+    std::filesystem::copy_file(argv[1], nestedRelinked);
+    redirected = dlopen_nid_postfix(nestedGuest.string().c_str(), 2);
+    Require(redirected != nullptr);
+    add = reinterpret_cast<Add>(dlsym_nid_postfix(redirected, "GuestModuleAdd"));
+    Require(add && add(39, 3) == 42);
+    Require(dlclose_nid_postfix(redirected) == 0);
+    std::filesystem::remove_all(nestedRoot);
 
     void* pinned = dlopen_nid_postfix(argv[1], 2);
     add = reinterpret_cast<Add>(dlsym_nid_postfix(pinned, "GuestModuleAdd"));

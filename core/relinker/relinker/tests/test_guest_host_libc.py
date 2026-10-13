@@ -34,9 +34,12 @@ def convert(relinker, case, libraries, modules, options=()):
     for name in modules:
         (case / "sce_module" / name).write_bytes(guest_fixture(PLAIN_SITE))
     output = case / "output.elf"
-    result = subprocess.run([str(relinker), *options, str(source), str(output)],
+    providers = [word for name in ("libkernel.prx", "libc.prx", "libSceLibcInternal.prx") for word in ("--runtime-provider", name)]
+    result = subprocess.run([str(relinker), *options, *providers, str(source), str(output)],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, (result.stdout, result.stderr)
+    if "other.prx" in modules:
+        assert (case / "app0/sce_module/other.prx.guest.prx").is_file()
     return needed_libraries(output.read_bytes())
 
 
@@ -48,18 +51,17 @@ def main():
 
         needed = convert(relinker, work / "bundled", imports, ["libc.prx", "other.prx"])
         assert needed == ["$ORIGIN/app0/sce_module/libc.prx.guest.prx",
-                          "$ORIGIN/app0/sce_module/other.prx.guest.prx",
                           "libkernel.prx", "libSceLibcInternal.prx", "libc.prx"], needed
 
         needed = convert(relinker, work / "without-internal", ("libkernel.prx", "libc.prx"), ["libc.prx"])
         assert needed == ["$ORIGIN/app0/sce_module/libc.prx.guest.prx", "libkernel.prx"], needed
 
         needed = convert(relinker, work / "not-bundled", imports, ["other.prx"])
-        assert needed == ["$ORIGIN/app0/sce_module/other.prx.guest.prx", *imports], needed
+        assert needed == list(imports), needed
 
         needed = convert(relinker, work / "excluded", imports, ["libc.prx", "other.prx"],
                          ["--exclude-sce-module", "libc.prx"])
-        assert needed == ["$ORIGIN/app0/sce_module/other.prx.guest.prx", *imports], needed
+        assert needed == list(imports), needed
     print("Guest host libc integration tests passed")
 
 

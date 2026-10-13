@@ -8,6 +8,11 @@
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
 
+inline constexpr std::uintptr_t ArenaStart = 0x0000000200000000ull;
+inline constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull;
+inline constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull;
+inline constexpr std::uintptr_t ApplicationAreaEnd = 0x000000FC00000000ull;
+
 extern "C" {
 
 bool GuestArenaAvailable_nid_postfix();

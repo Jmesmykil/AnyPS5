@@ -571,37 +571,9 @@ if(AGC_BUILD_VISUAL_TEST)
         list(APPEND visualShaders "${shaderOutput}")
     endforeach()
 
+    # Exercise the production renderer rather than a second copy of its state.
     add_test_executable(agc_driver_visual_test EXCLUDE_FROM_ALL
             tests/Visual.cpp
-            Execution/src/VulkanDevice.cpp
-            Execution/src/DisplayFormat.cpp
-            Execution/src/AspectFit.cpp
-            Execution/src/PresentationScaler.cpp
-            Execution/src/GuestMemory.cpp
-            Execution/src/BdaFeatures.cpp
-            Graphics/src/Draw.cpp
-            Graphics/src/DepthSurface.cpp
-            Graphics/src/ColorTargetLayout.cpp
-            Graphics/src/ColorTargetTransfer.cpp
-            Graphics/src/Pipeline.cpp
-            Graphics/src/PipelineCache.cpp
-            Graphics/src/Resources.cpp
-            Graphics/src/ShaderResources.cpp
-            Graphics/src/ShaderAddressResources.cpp
-            Graphics/src/GuestBufferMemory.cpp
-            Graphics/src/BdaResources.cpp
-            Graphics/src/BufferAddress.cpp
-            Graphics/src/ShaderValidation.cpp
-            Graphics/src/GuestTextureResource.cpp
-            Graphics/src/GuestSamplerResource.cpp
-            Graphics/src/TextureFormat.cpp
-            Graphics/src/DccMetadata.cpp
-            Graphics/src/TextureTiling.cpp
-            Graphics/src/TextureDetiler.cpp
-            Graphics/src/Texture.cpp
-            Graphics/src/UnitShadow.cpp
-            Graphics/src/Sampler.cpp
-            ${agcTextureDetileShaderHeader}
             ${visualShaders}
     )
 
@@ -619,6 +591,7 @@ if(AGC_BUILD_VISUAL_TEST)
     target_link_libraries(agc_driver_visual_test PRIVATE
             SDL2-static
             libc
+            libSceAgcDriver
     )
 
     set_target_properties(agc_driver_visual_test PROPERTIES CXX_EXTENSIONS OFF)
@@ -864,4 +837,19 @@ if(BUILD_TESTING)
         set_tests_properties(image_msaa_load PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+
+add_test_executable(agc_driver_import_watch_tests EXCLUDE_FROM_ALL tests/ImportWatch.cpp)
+target_include_directories(agc_driver_import_watch_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_driver_import_watch_tests PRIVATE libSceAgcDriver shader_recompiler_agc_driver libc)
+configure_windows_unwind(agc_driver_import_watch_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_import_watch_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_driver_import_watch COMMAND agc_driver_import_watch_tests)
+    add_test(NAME agc_driver_import_watch_none COMMAND agc_driver_import_watch_tests)
+    set_tests_properties(agc_driver_import_watch_none PROPERTIES ENVIRONMENT "APS5_NO_WRITE_WATCH=1" SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(agc_driver_import_watch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 endif()

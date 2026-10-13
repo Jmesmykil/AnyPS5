@@ -7,6 +7,7 @@
 #include <mutex>
 #include <array>
 #include <chrono>
+#include <charconv>
 #include <atomic>
 #include <algorithm>
 #include <functional>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -28,7 +30,13 @@
 #else
 #include <fstream>
 #include <pthread.h>
-#include <sstream>
+#if defined(__linux__)
+#include <cerrno>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 #endif
 
 namespace AgcDriver::GuestMemory {
@@ -478,6 +486,93 @@ struct PageRun {
     bool writable;
 };
 
+#if defined(__linux__)
+struct LinuxDescriptionProfile {
+    explicit LinuxDescriptionProfile(std::size_t bytes) : bytes(bytes) {}
+    std::size_t bytes;
+    std::uint64_t runs = 0;
+    std::uint64_t queries = 0;
+    bool binary = false;
+
+    ~LinuxDescriptionProfile() {
+        static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (!enabled) return;
+        struct Counters {
+            std::atomic<std::uint64_t> calls{0}, bytes{0}, runs{0}, queries{0}, binary{0}, text{0}, last{0};
+            std::array<std::atomic<std::uint64_t>, 4> sizes{};
+        };
+        static Counters totals;
+        totals.calls.fetch_add(1, std::memory_order_relaxed);
+        totals.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        totals.runs.fetch_add(runs, std::memory_order_relaxed);
+        totals.queries.fetch_add(queries, std::memory_order_relaxed);
+        (binary ? totals.binary : totals.text).fetch_add(1, std::memory_order_relaxed);
+        totals.sizes[bytes <= 4096 ? 0 : bytes <= 65536 ? 1 : bytes <= 1048576 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+        const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        auto last = totals.last.load(std::memory_order_relaxed);
+        if (last == 0) {
+            totals.last.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now < last || now - last < 10000 || !totals.last.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        AgcDriver::ProfilePrint_nid_no_patch("[vma] %llu descriptions, %llu bytes, %llu runs, %llu live kernel queries; binary %llu/text %llu; sizes <=4KiB %llu, <=64KiB %llu, <=1MiB %llu, larger %llu\n",
+            take(totals.calls), take(totals.bytes), take(totals.runs), take(totals.queries), take(totals.binary), take(totals.text),
+            take(totals.sizes[0]), take(totals.sizes[1]), take(totals.sizes[2]), take(totals.sizes[3]));
+    }
+};
+#endif
+
+#if defined(__linux__) && defined(PROCMAP_QUERY)
+enum class KernelDescription { Unsupported, Failed, Described };
+
+template <class Emit>
+KernelDescription describeKernelPages(std::uintptr_t address, std::size_t bytes, Emit&& emit, std::uint64_t& queries) {
+    struct MapsFile {
+        int descriptor = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+        ~MapsFile() { if (descriptor >= 0) ::close(descriptor); }
+    } maps;
+    if (maps.descriptor < 0) return KernelDescription::Failed;
+    const auto end = address + bytes;
+    auto cursor = address;
+    while (cursor < end) {
+        procmap_query query{};
+        query.size = sizeof(query);
+        // Do not filter by permissions: PROT_NONE mappings must still be described.
+        query.query_flags = PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
+        query.query_addr = cursor;
+        int result;
+        do {
+            ++queries;
+            result = ::ioctl(maps.descriptor, PROCMAP_QUERY, &query);
+        } while (result != 0 && errno == EINTR);
+        if (result != 0) {
+            if (errno == ENOENT) {
+                static_cast<void>(emit(PageRun{cursor, end, false, false}));
+                return KernelDescription::Described;
+            }
+            // Older kernels can use the fresh text path. Only fall back before
+            // emitting any runs, so callbacks are never repeated.
+            if (cursor == address && (errno == ENOTTY || errno == EOPNOTSUPP)) return KernelDescription::Unsupported;
+            return KernelDescription::Failed;
+        }
+        if (query.vma_start >= query.vma_end || query.vma_end <= cursor) return KernelDescription::Failed;
+        if (query.vma_start > cursor) {
+            const auto next = std::min<std::uintptr_t>(end, query.vma_start);
+            if (!emit(PageRun{cursor, next, false, false})) return KernelDescription::Described;
+            cursor = next;
+            if (cursor == end) return KernelDescription::Described;
+        }
+        const auto next = std::min<std::uintptr_t>(end, query.vma_end);
+        const bool readable = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0;
+        const bool writable = readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0;
+        if (!emit(PageRun{cursor, next, readable, writable})) return KernelDescription::Described;
+        cursor = next;
+    }
+    return KernelDescription::Described;
+}
+#endif
+
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
 template <class Emit>
@@ -486,12 +581,36 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     pages.initialize();
     const auto end = address + bytes;
     auto cursor = address;
+    if (cursor == end) return true;
+#if defined(__linux__)
+    LinuxDescriptionProfile profile(bytes);
+#endif
+    const auto emitRun = [&](const PageRun& run) {
+#if defined(__linux__)
+        ++profile.runs;
+#endif
+        return emit(run);
+    };
+#if defined(__linux__) && defined(PROCMAP_QUERY)
+    const auto binary = describeKernelPages(address, bytes, emitRun, profile.queries);
+    if (binary != KernelDescription::Unsupported) {
+        profile.binary = true;
+        return binary == KernelDescription::Described;
+    }
+#endif
+#ifndef _WIN32
+    // Query current mappings once per description, without keeping facts across calls:
+    // unregistered host mmap/mprotect/munmap changes must be visible on the next query.
+    std::ifstream maps("/proc/self/maps");
+    if (cursor < end && !maps.is_open()) return false;
+    std::string line;
+#endif
     while (cursor < end) {
         if (const auto* span = pages.spanOf(cursor)) {
             const auto value = span->load(cursor);
             if ((value & 3u) != 0) {
                 const auto next = span->runEnd(cursor, value, end);
-                if (!emit(PageRun{cursor, next, true, (value & PageWritable) != 0})) return true;
+                if (!emitRun(PageRun{cursor, next, true, (value & PageWritable) != 0})) return true;
                 cursor = next;
                 continue;
             }
@@ -532,36 +651,43 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) span->forget(first, static_cast<std::size_t>(last - first));
         }
         const auto next = std::min(end, regionEnd);
-        if (!emit(PageRun{cursor, next, readable, writable})) return true;
+        if (!emitRun(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
-        std::ifstream maps("/proc/self/maps");
-        if (!maps.is_open()) return false;
-        std::string line;
         bool found = false;
         while (std::getline(maps, line)) {
-            std::istringstream fields(line);
             std::uintptr_t first = 0;
             std::uintptr_t last = 0;
-            char separator = 0;
-            std::string permissions;
-            if (!(fields >> std::hex >> first >> separator >> last >> permissions) || separator != '-' || first >= last || permissions.size() < 2) return false;
+            const auto* stop = line.data() + line.size();
+            const auto from = std::from_chars(line.data(), stop, first, 16);
+            if (from.ec != std::errc{} || from.ptr == stop || *from.ptr != '-') return false;
+            const auto to = std::from_chars(from.ptr + 1, stop, last, 16);
+            if (to.ec != std::errc{} || first >= last) return false;
+            constexpr std::string_view spaces = " \t\r\n\f\v";
+            std::string_view permissions(to.ptr, static_cast<std::size_t>(stop - to.ptr));
+            if (permissions.empty() || spaces.find(permissions.front()) == std::string_view::npos) return false;
+            const auto firstFlag = permissions.find_first_not_of(spaces);
+            if (firstFlag == std::string_view::npos) return false;
+            permissions.remove_prefix(firstFlag);
+            permissions = permissions.substr(0, permissions.find_first_of(spaces));
+            if (permissions.size() < 2) return false;
             if (last <= cursor) continue;
             if (first > cursor) {
                 const auto gapEnd = std::min(end, first);
-                if (!emit(PageRun{cursor, gapEnd, false, false})) return true;
+                if (!emitRun(PageRun{cursor, gapEnd, false, false})) return true;
                 cursor = gapEnd;
-                found = true;
-                break;
+                if (cursor == end) return true;
+                // The current line describes the mapping after this gap. Emit it
+                // now; advancing the stream first would incorrectly skip that mapping.
             }
             const auto next = std::min(end, last);
-            if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
+            if (!emitRun(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
             cursor = next;
             found = true;
             break;
         }
         if (!found) {
-            static_cast<void>(emit(PageRun{cursor, end, false, false}));
+            static_cast<void>(emitRun(PageRun{cursor, end, false, false}));
             return true;
         }
 #endif

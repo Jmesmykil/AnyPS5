@@ -140,28 +140,51 @@ namespace {
 constexpr int GuestMapFixedFlag = 0x10;
 
 #if defined(__linux__)
-void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
-    constexpr std::uintptr_t UserLimit = 0x7fff00000000ull;
+void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment, bool canonical = false) {
+    const auto limit = canonical ? GuestArena::ApplicationAreaEnd : std::uintptr_t{0x7fff00000000ull};
+    const auto aligned = [alignment, limit](std::uintptr_t value) {
+        const auto padding = (std::uintptr_t{0} - value) & (static_cast<std::uintptr_t>(alignment) - 1);
+        if (value > limit || padding > limit - value)
+            throw std::runtime_error("No aligned range inside the mapping address limit");
+        return value + padding;
+    };
+    if (start > limit || len > limit - start)
+        throw std::runtime_error("Mapping range exceeds the address limit");
     for (int attempt = 0; attempt < 8; ++attempt) {
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> used;
         std::ifstream maps("/proc/self/maps");
+        if (!maps.is_open()) throw std::runtime_error("Cannot read live mapping ranges");
         std::string line;
         while (std::getline(maps, line)) {
             std::istringstream fields(line);
             std::uintptr_t begin = 0, end = 0;
             char dash = 0;
-            if (fields >> std::hex >> begin >> dash >> end) used.emplace_back(begin, end);
+            if (!(fields >> std::hex >> begin >> dash >> end) || dash != '-' || end < begin)
+                throw std::runtime_error("Invalid live mapping range");
+            used.emplace_back(begin, end);
         }
+        if (maps.bad()) throw std::runtime_error("Incomplete live mapping ranges");
+        if (canonical) used.emplace_back(GuestArena::SystemReservedStart, GuestArena::SystemReservedEnd);
         std::sort(used.begin(), used.end());
-        auto candidate = (start + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+        auto candidate = aligned(start);
         for (const auto& [begin, end] : used) {
             if (end <= candidate) continue;
+            if (candidate > limit || len > limit - candidate)
+                throw std::runtime_error("No free range inside the mapping address limit");
             if (begin >= candidate + len) break;
-            candidate = (end + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+            candidate = aligned(end);
         }
-        if (candidate + len > UserLimit || candidate + len < candidate) throw std::runtime_error("No free range above the mapping address hint");
+        if (candidate > limit || len > limit - candidate) throw std::runtime_error("No free range above the mapping address hint");
         void* result = mmap(reinterpret_cast<void*>(candidate), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (result != MAP_FAILED) return result;
+        if (result != MAP_FAILED) {
+            // Older kernels may ignore an unknown NOREPLACE flag and place a
+            // hinted mapping elsewhere. Such a result is never registered.
+            if (result != reinterpret_cast<void*>(candidate)) {
+                if (::munmap(result, len) != 0) throw std::system_error(errno, std::generic_category(), "Unexpected placement cleanup failed");
+                throw std::runtime_error("Kernel did not honor exact no-replace placement");
+            }
+            return result;
+        }
         if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "Hinted mmap failed");
     }
     throw std::runtime_error("Hinted mmap kept racing with other mappings");
@@ -470,6 +493,8 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
+#elif defined(__linux__)
+    return MapAtOrAbove(GuestArena::ArenaStart, len, prot, alignment, true);
 #endif
     if (len > std::numeric_limits<size_t>::max() - alignment) {
         throw std::overflow_error("Aligned mapping size overflow");

@@ -24,6 +24,16 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     const auto extraOffset = bytes.size();
     const auto extraAddress = Io::AlignUp64(end, 0x4000);
     const auto address = [&] { return extraAddress + bytes.size() - extraOffset; };
+    const auto lifecycleRecord = address();
+    Io::AppendU64(bytes, 0x3159434c35535041ull);
+    Io::AppendU32(bytes, 32);
+    Io::AppendU32(bytes, 1);
+    Io::AppendU32(bytes, (image.Init != 0 ? 1u : 0u) | (!image.InitArray.empty() ? 2u : 0u));
+    Io::AppendU32(bytes, 0);
+    Io::AppendU32(bytes, 0);
+    Io::AppendU32(bytes, 0);
+    const auto argsSlot = address();
+    if (image.Init != 0) Io::AppendU64(bytes, 0);
     auto strings = image.Dynamic.DynStrData;
     auto symbols = image.Dynamic.DynSymData;
     const auto addString = [&](const std::string& value) {
@@ -44,6 +54,25 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     std::vector<std::uint64_t> needed;
     for (const auto& dependency : dependencies) needed.push_back(addString(dependency));
     if (needsTlsResolver) needed.push_back(addString("ld-linux-x86-64.so.2"));
+    const auto addSymbol = [&](const std::string& name, std::uint8_t info, std::uint16_t section, std::uint64_t value, std::uint64_t size) {
+        for (const auto& existing : image.Symbols) if (existing.Name == name) throw Domain::RelinkerException("Reserved guest lifecycle symbol: " + name);
+        const auto index = symbols.size() / 24;
+        symbols.resize(symbols.size() + 24, 0);
+        Io::WriteU32(symbols, index * 24, addString(name));
+        symbols[index * 24 + 4] = info;
+        Io::WriteU16(symbols, index * 24 + 6, section);
+        Io::WriteU64(symbols, index * 24 + 8, value);
+        Io::WriteU64(symbols, index * 24 + 16, size);
+        return index;
+    };
+    addSymbol("__aps5_guest_lifecycle_nid_no_patch", 0x11, 1, lifecycleRecord, 32);
+    auto relaData = image.Dynamic.RelaData;
+    if (image.Init != 0) {
+        const auto index = addSymbol("__aps5_get_pending_module_args_nid_no_patch", 0x12, 0, 0, 0);
+        Io::AppendU64(relaData, argsSlot);
+        Io::AppendU64(relaData, (index << 32) | 6);
+        Io::AppendU64(relaData, 0);
+    }
     const auto soname = addString(image.OutputName);
     const auto search = addString(runPath);
     const auto strAddress = address();
@@ -52,14 +81,14 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     const auto symAddress = address();
     bytes.insert(bytes.end(), symbols.begin(), symbols.end());
     const auto hashAddress = address();
-    const auto count = static_cast<std::uint32_t>(image.Symbols.size());
+    const auto count = static_cast<std::uint32_t>(symbols.size() / 24);
     Io::AppendU32(bytes, 1);
     Io::AppendU32(bytes, count);
     Io::AppendU32(bytes, count > 1 ? 1 : 0);
     for (std::uint32_t index = 0; index < count; ++index) Io::AppendU32(bytes, index != 0 && index + 1 < count ? index + 1 : 0);
     Io::AlignBuffer(bytes, 8);
     const auto relaAddress = address();
-    bytes.insert(bytes.end(), image.Dynamic.RelaData.begin(), image.Dynamic.RelaData.end());
+    bytes.insert(bytes.end(), relaData.begin(), relaData.end());
     const auto pltAddress = address();
     bytes.insert(bytes.end(), image.Dynamic.RelaPltData.begin(), image.Dynamic.RelaPltData.end());
     const auto lifecycle = [&](std::uint64_t target) {
@@ -71,7 +100,27 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
         Io::AppendU32(bytes, static_cast<std::uint32_t>(displacement));
         return start;
     };
-    const auto init = lifecycle(image.Init);
+    std::uint64_t init = 0;
+    if (image.Init != 0) {
+        init = address();
+        const auto relative = [&](std::uint64_t target, std::uint64_t next) {
+            const auto distance = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(next);
+            if (distance < std::numeric_limits<std::int32_t>::min() || distance > std::numeric_limits<std::int32_t>::max()) throw Domain::RelinkerException("Guest lifecycle exceeds relative branch range");
+            return static_cast<std::uint32_t>(distance);
+        };
+        bytes.insert(bytes.end(), {0x50, 0x48, 0x8d, 0x3d});
+        Io::AppendU32(bytes, relative(init, address() + 4));
+        bytes.insert(bytes.end(), {0xff, 0x15});
+        Io::AppendU32(bytes, relative(argsSlot, address() + 4));
+        bytes.insert(bytes.end(), {0x48, 0x8b, 0x38, 0x48, 0x8b, 0x70, 0x08, 0x31, 0xd2, 0xe8});
+        Io::AppendU32(bytes, relative(image.Init, address() + 4));
+        bytes.insert(bytes.end(), {0x89, 0x05});
+        Io::AppendU32(bytes, relative(lifecycleRecord + 20, address() + 4));
+        bytes.insert(bytes.end(), {0xc7, 0x05});
+        Io::AppendU32(bytes, relative(lifecycleRecord + 24, address() + 8));
+        Io::AppendU32(bytes, 1);
+        bytes.insert(bytes.end(), {0x58, 0xc3});
+    }
     const auto fini = lifecycle(image.Fini);
     Io::AlignBuffer(bytes, 8);
     const auto dynamicOffset = bytes.size();
@@ -85,9 +134,9 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     tag(10, strings.size());
     tag(6, symAddress);
     tag(11, 24);
-    if (!image.Dynamic.RelaData.empty()) {
+    if (!relaData.empty()) {
         tag(7, relaAddress);
-        tag(8, image.Dynamic.RelaData.size());
+        tag(8, relaData.size());
         tag(9, 24);
     }
     if (!image.Dynamic.RelaPltData.empty()) {

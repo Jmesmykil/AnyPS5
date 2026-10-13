@@ -120,9 +120,9 @@ def main():
         output = convert(relinker, work)
         modules = output.parent / "app0" / "sce_module"
         libc = module_symbols((modules / "libc.prx.guest.prx").read_bytes())
-        assert libc == ["AAAAAAAAAAA#guest", "BBBBBBBBBBB#guest", "CCCCCCCCCCC", "EEEEEEEEEEE#guest"], libc
+        assert libc == ["AAAAAAAAAAA#guest", "BBBBBBBBBBB#guest", "CCCCCCCCCCC", "EEEEEEEEEEE#guest", "__aps5_guest_lifecycle_nid_no_patch"], libc
         other = module_symbols((modules / "other.prx.guest.prx").read_bytes())
-        assert other == ["BBBBBBBBBBB#guest", "EEEEEEEEEEE#guest"], other
+        assert other == ["BBBBBBBBBBB#guest", "EEEEEEEEEEE#guest", "__aps5_guest_lifecycle_nid_no_patch"], other
         imports = imported_symbols(output.read_bytes())
         assert imports == {"AAAAAAAAAAA#guest", "DDDDDDDDDDD"}, imports
     print("Guest symbol name tests passed")
